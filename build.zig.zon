@@ -1,7 +1,15 @@
 .{
     .name = .unicorn,
+    .fingerprint = 0x58fbd83f4fc8f4ac,
     .version = "2.1.4",
-    .minimum_zig_version = "0.14.0-dev.3445+6c3cbb0c8",
-    .fingerprint = 0x58fbd83f3bf465b6,
-    .paths = .{""},
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "glib_compat",
+        "include",
+        "list.c",
+        "qemu",
+        "uc.c",
+    },
 }

@@ -1,266 +1,695 @@
-//! License: GNU GENERAL PUBLIC LICENSE Version 2
-
 const std = @import("std");
-const MIN_ZIG_VERSION: []const u8 = "0.13.0";
-const MIN_ZIG_VERSION_ERR_MSG = "Please! Update zig toolchain to >= v" ++ MIN_ZIG_VERSION;
+const Allocator = std.mem.Allocator;
 
-const SampleFileTypes = enum {
-    c,
-    cpp,
-    zig,
+pub const Arch = enum {
+    x86,
+    arm,
+    aarch64,
+    m68k,
+    mips,
+    sparc,
+    ppc,
+    riscv,
+    s390x,
+    tricore,
 };
 
-const SampleDescripton = struct {
-    file_type: SampleFileTypes,
-    root_file_path: []const u8,
+fn makeUnicornCFlags(arena: Allocator, archs: std.EnumSet(Arch)) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    try list.append(arena, "-fno-sanitize=function");
+    var it = archs.iterator();
+    while (it.next()) |arch| {
+        switch (arch) {
+            .x86 => try list.append(arena, "-DUNICORN_HAS_X86"),
+            .arm => try list.append(arena, "-DUNICORN_HAS_ARM"),
+            .aarch64 => try list.append(arena, "-DUNICORN_HAS_ARM64"),
+            .m68k => try list.append(arena, "-DUNICORN_HAS_M68K"),
+            .mips => try list.appendSlice(arena, &.{
+                "-DUNICORN_HAS_MIPS",
+                "-DUNICORN_HAS_MIPSEL",
+                "-DUNICORN_HAS_MIPS64",
+                "-DUNICORN_HAS_MIPS64EL",
+            }),
+            .sparc => try list.append(arena, "-DUNICORN_HAS_SPARC"),
+            .ppc => try list.append(arena, "-DUNICORN_HAS_PPC"),
+            .riscv => try list.append(arena, "-DUNICORN_HAS_RISCV"),
+            .s390x => try list.append(arena, "-DUNICORN_HAS_S390X"),
+            .tricore => try list.append(arena, "-DUNICORN_HAS_TRICORE"),
+        }
+    }
+    return list.items;
+}
+
+const HostConfig = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    lto: std.zig.LtoMode,
+    config_header: *std.Build.Step.ConfigHeader,
+    include_paths: []const std.Build.LazyPath,
 };
 
-/// Create a module for the Zig Bindings
-///
-/// This will also get exported as a library that other zig projects can use
-/// as a dependency via the zig build system.
-fn create_unicorn_sys(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const unicorn_sys = b.addModule("unicorn-sys", .{
+const TargetConfig = struct {
+    name: []const u8,
+    files: []const []const u8,
+    include_paths: []const []const u8,
+    autogen_header_contents: []const u8,
+};
+
+fn createTargetLibrary(
+    b: *std.Build,
+    host: HostConfig,
+    comptime target: TargetConfig,
+    comptime defines: anytype,
+) *std.Build.Step.Compile {
+    const config_target = b.addConfigHeader(.{ .include_path = "config-target.h" }, defines);
+    const mod = b.createModule(.{
+        .target = host.target,
+        .optimize = host.optimize,
+        .link_libc = true,
+    });
+    mod.addConfigHeader(host.config_header);
+    mod.addConfigHeader(config_target);
+    for (host.include_paths) |path| mod.addIncludePath(path);
+    for (target.include_paths) |path| mod.addIncludePath(b.path(path));
+    var it = std.mem.splitScalar(u8, target.autogen_header_contents, '\n');
+    while (it.next()) |line| {
+        const define = std.mem.cutPrefix(u8, line, "#define ") orelse continue;
+        const key, const value = std.mem.cutScalar(u8, define, ' ') orelse .{ define, "" };
+        mod.addCMacro(key, value);
+    }
+    mod.addCSourceFiles(.{
+        .root = b.path(""),
+        .files = .{
+            "qemu/exec.c",
+            "qemu/exec-vary.c",
+            "qemu/softmmu/cpus.c",
+            "qemu/softmmu/ioport.c",
+            "qemu/softmmu/memory.c",
+            "qemu/softmmu/memory_mapping.c",
+            "qemu/fpu/softfloat.c",
+            "qemu/tcg/optimize.c",
+            "qemu/tcg/tcg.c",
+            "qemu/tcg/tcg-op.c",
+            "qemu/tcg/tcg-op-gvec.c",
+            "qemu/tcg/tcg-op-vec.c",
+            "qemu/accel/tcg/cpu-exec.c",
+            "qemu/accel/tcg/cpu-exec-common.c",
+            "qemu/accel/tcg/cputlb.c",
+            "qemu/accel/tcg/tcg-all.c",
+            "qemu/accel/tcg/tcg-runtime.c",
+            "qemu/accel/tcg/tcg-runtime-gvec.c",
+            "qemu/accel/tcg/translate-all.c",
+            "qemu/accel/tcg/translator.c",
+            "qemu/softmmu/unicorn_vtlb.c",
+        } ++ target.files,
+        .flags = &.{ "-fno-sanitize=function", "-DNEED_CPU_H" },
+    });
+    const lib = b.addLibrary(.{
+        .name = target.name,
+        .root_module = mod,
+    });
+    lib.lto = host.lto;
+    return lib;
+}
+
+pub fn build(b: *std.Build) !void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const lto = b.option(std.zig.LtoMode, "lto", "Link-time optimization mode") orelse .none;
+    var archs: std.EnumSet(Arch) = .empty;
+    if (b.option([]const Arch, "arch", "Enabled unicorn architectures")) |list| {
+        for (list) |i| archs.insert(i);
+    } else {
+        archs = .full;
+    }
+
+    const arena = b.graph.arena;
+    const cflags = try makeUnicornCFlags(arena, archs);
+
+    const tcg_target = switch (target.result.cpu.arch) {
+        .x86, .x86_64 => "i386",
+        .arm, .armeb, .thumb, .thumbeb => "arm",
+        .aarch64, .aarch64_be => "aarch64",
+        .mips, .mipsel, .mips64, .mips64el => "mips",
+        .sparc, .sparc64 => "sparc",
+        .powerpc, .powerpcle, .powerpc64, .powerpc64le => "ppc",
+        .riscv32, .riscv32be, .riscv64, .riscv64be => "riscv",
+        .s390x => "s390",
+        .loongarch64 => "loongarch64",
+        else => return error.UnsupportedTarget,
+    };
+
+    const is_macos = target.result.os.tag == .macos;
+    const is_windows = target.result.os.tag == .windows;
+    const endian = target.result.cpu.arch.endian();
+
+    const host: HostConfig = .{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("bindings/zig/unicorn/unicorn.zig"),
-    });
-
-    // link libc
-    unicorn_sys.link_libc = true;
-
-    // we need the c header for the zig-bindings
-    unicorn_sys.addIncludePath(b.path("include"));
-    unicorn_sys.addLibraryPath(b.path("build"));
-
-    // Linking to the Unicorn library
-    if (target.result.abi == .msvc and target.result.os.tag == .windows) {
-        unicorn_sys.linkSystemLibrary("unicorn.dll", .{});
-    } else {
-        unicorn_sys.linkSystemLibrary("unicorn", .{});
-    }
-
-    return unicorn_sys;
-}
-
-// Although this function looks imperative, note that its job is to
-// declaratively construct a build graph that will be executed by an external
-// runner.
-pub fn build(b: *std.Build) void {
-    if (comptime !checkVersion())
-        @compileError(MIN_ZIG_VERSION_ERR_MSG);
-
-    // Standard target options allows the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
-    const target = b.standardTargetOptions(.{});
-
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
-    const optimize = b.standardOptimizeOption(.{});
-
-    // Give the user the options to perform the cmake build in parallel or not
-    // (eg. ci on macos will fail if parallel is enabled)
-    //
-    // flag: -Dparallel=true/false
-    const parallel_cmake = b.option(bool, "parallel", "Enable parallel cmake build") orelse true;
-
-    // flag: -DSamples=True/False
-    const samples = b.option(bool, "Samples", "Build all Samples [default: true]") orelse true;
-
-    const sample_bins = [_]SampleDescripton{
-        .{ .file_type = .zig, .root_file_path = "bindings/zig/sample/sample_riscv_zig.zig" },
-        .{ .file_type = .c, .root_file_path = "samples/sample_arm.c" },
-        .{ .file_type = .c, .root_file_path = "samples/sample_arm64.c" },
-        .{ .file_type = .c, .root_file_path = "samples/sample_ctl.c" },
-        .{ .file_type = .c, .root_file_path = "samples/sample_batch_reg.c" },
-        .{ .file_type = .c, .root_file_path = "samples/sample_m68k.c" },
-        .{ .file_type = .c, .root_file_path = "samples/sample_riscv.c" },
-        .{ .file_type = .c, .root_file_path = "samples/sample_sparc.c" },
-        .{ .file_type = .c, .root_file_path = "samples/sample_s390x.c" },
-        .{ .file_type = .c, .root_file_path = "samples/shellcode.c" },
-        .{ .file_type = .c, .root_file_path = "samples/sample_tricore.c" },
-        .{ .file_type = .c, .root_file_path = "samples/sample_x86.c" },
-        .{ .file_type = .c, .root_file_path = "samples/sample_x86_32_gdt_and_seg_regs.c" },
+        .lto = lto,
+        .config_header = b.addConfigHeader(.{ .include_path = "config-host.h" }, .{
+            .CONFIG_CMPXCHG128 = true,
+            .CONFIG_INT128 = true,
+            .CONFIG_MADVISE = if (is_windows) null else true,
+            .CONFIG_POSIX = if (is_windows) null else true,
+            .CONFIG_POSIX_MEMALIGN = if (is_windows) null else true,
+            .CONFIG_PRAGMA_DIAGNOSTIC_AVAILABLE = true,
+            .CONFIG_STATIC_ASSERT = true,
+            .HAVE_PTHREAD_JIT_PROTECT = if (is_macos) true else null,
+            .HOST_WORDS_BIGENDIAN = if (endian == .big) true else null,
+        }),
+        .include_paths = &.{
+            b.path("glib_compat"),
+            b.path("qemu"),
+            b.path("qemu/include"),
+            b.path("qemu/tcg").path(b, tcg_target),
+            b.path("include"),
+        },
     };
 
-    // make a module for Zig Bindings
-    const unicorn_sys = create_unicorn_sys(b, target, optimize);
+    const libunicorn_common = unicorn_common: {
+        const mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        mod.addConfigHeader(host.config_header);
+        for (host.include_paths) |path| mod.addIncludePath(path);
+        mod.addCSourceFiles(.{
+            .root = b.path(""),
+            .files = &(.{
+                "list.c",
+                "glib_compat/glib_compat.c",
+                "glib_compat/gtestutils.c",
+                "glib_compat/garray.c",
+                "glib_compat/gtree.c",
+                "glib_compat/grand.c",
+                "glib_compat/glist.c",
+                "glib_compat/gmem.c",
+                "glib_compat/gpattern.c",
+                "glib_compat/gslice.c",
+                "qemu/util/bitmap.c",
+                "qemu/util/bitops.c",
+                "qemu/util/crc32c.c",
+                "qemu/util/cutils.c",
+                "qemu/util/getauxval.c",
+                "qemu/util/guest-random.c",
+                "qemu/util/host-utils.c",
+                "qemu/util/osdep.c",
+                "qemu/util/qdist.c",
+                "qemu/util/qemu-timer.c",
+                "qemu/util/qemu-timer-common.c",
+                "qemu/util/range.c",
+                "qemu/util/qht.c",
+                "qemu/util/pagesize.c",
+                "qemu/util/cacheinfo.c",
+                "qemu/crypto/aes.c",
+            } ++ if (is_windows and !target.result.abi.isGnu()) .{
+                "qemu/util/oslib-win32.c",
+                "qemu/util/qemu-thread-win32.c",
+            } else .{
+                "qemu/util/oslib-posix.c",
+                "qemu/util/qemu-thread-posix.c",
+            }),
+            .flags = cflags,
+        });
+        const lib = b.addLibrary(.{
+            .name = "unicorn-common",
+            .root_module = mod,
+        });
+        lib.lto = lto;
+        break :unicorn_common lib;
+    };
 
-    // Build Samples
-    if (samples) {
-        for (sample_bins) |sample| {
-            const sample_bin = buildExe(b, .{
-                .target = target,
-                .optimize = optimize,
-                .filetype = sample.file_type,
-                .filepath = sample.root_file_path,
-            });
+    const libx86_64_softmmu = createTargetLibrary(b, host, .{
+        .name = "x86_64-softmmu",
+        .files = &.{
+            "qemu/hw/i386/x86.c",
+            "qemu/target/i386/arch_memory_mapping.c",
+            "qemu/target/i386/bpt_helper.c",
+            "qemu/target/i386/cc_helper.c",
+            "qemu/target/i386/cpu.c",
+            "qemu/target/i386/excp_helper.c",
+            "qemu/target/i386/fpu_helper.c",
+            "qemu/target/i386/helper.c",
+            "qemu/target/i386/int_helper.c",
+            "qemu/target/i386/machine.c",
+            "qemu/target/i386/mem_helper.c",
+            "qemu/target/i386/misc_helper.c",
+            "qemu/target/i386/mpx_helper.c",
+            "qemu/target/i386/seg_helper.c",
+            "qemu/target/i386/smm_helper.c",
+            "qemu/target/i386/svm_helper.c",
+            "qemu/target/i386/translate.c",
+            "qemu/target/i386/xsave_helper.c",
+            "qemu/target/i386/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/i386"},
+        .autogen_header_contents = @embedFile("qemu/x86_64.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_I386 = true,
+        .TARGET_X86_64 = true,
+    });
 
-            // import the unicorn sys module if this is a zig build
-            if (sample.file_type == .zig) {
-                sample_bin.root_module.addImport("unicorn", unicorn_sys);
+    const libarm_softmmu = createTargetLibrary(b, host, .{
+        .name = "arm-softmmu",
+        .files = &.{
+            "qemu/target/arm/cpu.c",
+            "qemu/target/arm/crypto_helper.c",
+            "qemu/target/arm/debug_helper.c",
+            "qemu/target/arm/helper.c",
+            "qemu/target/arm/iwmmxt_helper.c",
+            "qemu/target/arm/m_helper.c",
+            "qemu/target/arm/neon_helper.c",
+            "qemu/target/arm/op_helper.c",
+            "qemu/target/arm/psci.c",
+            "qemu/target/arm/tlb_helper.c",
+            "qemu/target/arm/translate.c",
+            "qemu/target/arm/vec_helper.c",
+            "qemu/target/arm/vfp_helper.c",
+            "qemu/target/arm/unicorn_arm.c",
+        },
+        .include_paths = &.{"qemu/target/arm"},
+        .autogen_header_contents = @embedFile("qemu/arm.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_ARM = true,
+    });
+
+    const libaarch64_softmmu = createTargetLibrary(b, host, .{
+        .name = "aarch64-softmmu",
+        .files = &.{
+            "qemu/target/arm/cpu64.c",
+            "qemu/target/arm/cpu.c",
+            "qemu/target/arm/crypto_helper.c",
+            "qemu/target/arm/debug_helper.c",
+            "qemu/target/arm/helper-a64.c",
+            "qemu/target/arm/helper.c",
+            "qemu/target/arm/iwmmxt_helper.c",
+            "qemu/target/arm/m_helper.c",
+            "qemu/target/arm/neon_helper.c",
+            "qemu/target/arm/op_helper.c",
+            "qemu/target/arm/pauth_helper.c",
+            "qemu/target/arm/psci.c",
+            "qemu/target/arm/sve_helper.c",
+            "qemu/target/arm/tlb_helper.c",
+            "qemu/target/arm/translate-a64.c",
+            "qemu/target/arm/translate.c",
+            "qemu/target/arm/translate-sve.c",
+            "qemu/target/arm/vec_helper.c",
+            "qemu/target/arm/vfp_helper.c",
+            "qemu/target/arm/unicorn_aarch64.c",
+        },
+        .include_paths = &.{"qemu/target/arm"},
+        .autogen_header_contents = @embedFile("qemu/aarch64.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_AARCH64 = true,
+        .TARGET_ARM = true,
+    });
+
+    const libm68k_softmmu = createTargetLibrary(b, host, .{
+        .name = "m68k-softmmu",
+        .files = &.{
+            "qemu/target/m68k/cpu.c",
+            "qemu/target/m68k/fpu_helper.c",
+            "qemu/target/m68k/helper.c",
+            "qemu/target/m68k/op_helper.c",
+            "qemu/target/m68k/softfloat.c",
+            "qemu/target/m68k/translate.c",
+            "qemu/target/m68k/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/m68k"},
+        .autogen_header_contents = @embedFile("qemu/m68k.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_M68K = true,
+        .TARGET_WORDS_BIGENDIAN = true,
+    });
+
+    const libmips_softmmu = createTargetLibrary(b, host, .{
+        .name = "mips-softmmu",
+        .files = &.{
+            "qemu/target/mips/cp0_helper.c",
+            "qemu/target/mips/cp0_timer.c",
+            "qemu/target/mips/cpu.c",
+            "qemu/target/mips/dsp_helper.c",
+            "qemu/target/mips/fpu_helper.c",
+            "qemu/target/mips/helper.c",
+            "qemu/target/mips/lmi_helper.c",
+            "qemu/target/mips/msa_helper.c",
+            "qemu/target/mips/op_helper.c",
+            "qemu/target/mips/translate.c",
+            "qemu/target/mips/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/mips"},
+        .autogen_header_contents = @embedFile("qemu/mips.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_ALIGNED_ONLY = true,
+        .TARGET_MIPS = true,
+        .TARGET_WORDS_BIGENDIAN = true,
+    });
+
+    const libmipsel_softmmu = createTargetLibrary(b, host, .{
+        .name = "mipsel-softmmu",
+        .files = &.{
+            "qemu/target/mips/cp0_helper.c",
+            "qemu/target/mips/cp0_timer.c",
+            "qemu/target/mips/cpu.c",
+            "qemu/target/mips/dsp_helper.c",
+            "qemu/target/mips/fpu_helper.c",
+            "qemu/target/mips/helper.c",
+            "qemu/target/mips/lmi_helper.c",
+            "qemu/target/mips/msa_helper.c",
+            "qemu/target/mips/op_helper.c",
+            "qemu/target/mips/translate.c",
+            "qemu/target/mips/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/mips"},
+        .autogen_header_contents = @embedFile("qemu/mipsel.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_ALIGNED_ONLY = true,
+        .TARGET_MIPS = true,
+    });
+
+    const libmips64_softmmu = createTargetLibrary(b, host, .{
+        .name = "mips64-softmmu",
+        .files = &.{
+            "qemu/target/mips/cp0_helper.c",
+            "qemu/target/mips/cp0_timer.c",
+            "qemu/target/mips/cpu.c",
+            "qemu/target/mips/dsp_helper.c",
+            "qemu/target/mips/fpu_helper.c",
+            "qemu/target/mips/helper.c",
+            "qemu/target/mips/lmi_helper.c",
+            "qemu/target/mips/msa_helper.c",
+            "qemu/target/mips/op_helper.c",
+            "qemu/target/mips/translate.c",
+            "qemu/target/mips/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/mips"},
+        .autogen_header_contents = @embedFile("qemu/mips64.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_ALIGNED_ONLY = true,
+        .TARGET_MIPS = true,
+        .TARGET_MIPS64 = true,
+        .TARGET_WORDS_BIGENDIAN = true,
+    });
+
+    const libmips64el_softmmu = createTargetLibrary(b, host, .{
+        .name = "mips64el-softmmu",
+        .files = &.{
+            "qemu/target/mips/cp0_helper.c",
+            "qemu/target/mips/cp0_timer.c",
+            "qemu/target/mips/cpu.c",
+            "qemu/target/mips/dsp_helper.c",
+            "qemu/target/mips/fpu_helper.c",
+            "qemu/target/mips/helper.c",
+            "qemu/target/mips/lmi_helper.c",
+            "qemu/target/mips/msa_helper.c",
+            "qemu/target/mips/op_helper.c",
+            "qemu/target/mips/translate.c",
+            "qemu/target/mips/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/mips"},
+        .autogen_header_contents = @embedFile("qemu/mips64el.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_ALIGNED_ONLY = true,
+        .TARGET_MIPS = true,
+        .TARGET_MIPS64 = true,
+    });
+
+    const libsparc_softmmu = createTargetLibrary(b, host, .{
+        .name = "sparc-softmmu",
+        .files = &.{
+            "qemu/target/sparc/cc_helper.c",
+            "qemu/target/sparc/cpu.c",
+            "qemu/target/sparc/fop_helper.c",
+            "qemu/target/sparc/helper.c",
+            "qemu/target/sparc/int32_helper.c",
+            "qemu/target/sparc/ldst_helper.c",
+            "qemu/target/sparc/mmu_helper.c",
+            "qemu/target/sparc/translate.c",
+            "qemu/target/sparc/win_helper.c",
+            "qemu/target/sparc/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/sparc"},
+        .autogen_header_contents = @embedFile("qemu/sparc.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_ALIGNED_ONLY = true,
+        .TARGET_SPARC = true,
+        .TARGET_WORDS_BIGENDIAN = true,
+    });
+
+    const libsparc64_softmmu = createTargetLibrary(b, host, .{
+        .name = "sparc64-softmmu",
+        .files = &.{
+            "qemu/target/sparc/cc_helper.c",
+            "qemu/target/sparc/cpu.c",
+            "qemu/target/sparc/fop_helper.c",
+            "qemu/target/sparc/helper.c",
+            "qemu/target/sparc/int64_helper.c",
+            "qemu/target/sparc/ldst_helper.c",
+            "qemu/target/sparc/mmu_helper.c",
+            "qemu/target/sparc/translate.c",
+            "qemu/target/sparc/vis_helper.c",
+            "qemu/target/sparc/win_helper.c",
+            "qemu/target/sparc/unicorn64.c",
+        },
+        .include_paths = &.{"qemu/target/sparc"},
+        .autogen_header_contents = @embedFile("qemu/sparc64.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_ALIGNED_ONLY = true,
+        .TARGET_SPARC = true,
+        .TARGET_SPARC64 = true,
+        .TARGET_WORDS_BIGENDIAN = true,
+    });
+
+    const libppc_softmmu = createTargetLibrary(b, host, .{
+        .name = "ppc-softmmu",
+        .files = &.{
+            "qemu/hw/ppc/ppc.c",
+            "qemu/hw/ppc/ppc_booke.c",
+            "qemu/libdecnumber/decContext.c",
+            "qemu/libdecnumber/decNumber.c",
+            "qemu/libdecnumber/dpd/decimal128.c",
+            "qemu/libdecnumber/dpd/decimal32.c",
+            "qemu/libdecnumber/dpd/decimal64.c",
+            "qemu/target/ppc/cpu.c",
+            "qemu/target/ppc/cpu-models.c",
+            "qemu/target/ppc/dfp_helper.c",
+            "qemu/target/ppc/excp_helper.c",
+            "qemu/target/ppc/fpu_helper.c",
+            "qemu/target/ppc/int_helper.c",
+            "qemu/target/ppc/machine.c",
+            "qemu/target/ppc/mem_helper.c",
+            "qemu/target/ppc/misc_helper.c",
+            "qemu/target/ppc/mmu-hash32.c",
+            "qemu/target/ppc/mmu_helper.c",
+            "qemu/target/ppc/timebase_helper.c",
+            "qemu/target/ppc/translate.c",
+            "qemu/target/ppc/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/ppc"},
+        .autogen_header_contents = @embedFile("qemu/ppc.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_PPC = true,
+        .TARGET_WORDS_BIGENDIAN = true,
+    });
+
+    const libppc64_softmmu = createTargetLibrary(b, host, .{
+        .name = "ppc64-softmmu",
+        .files = &.{
+            "qemu/hw/ppc/ppc.c",
+            "qemu/hw/ppc/ppc_booke.c",
+            "qemu/libdecnumber/decContext.c",
+            "qemu/libdecnumber/decNumber.c",
+            "qemu/libdecnumber/dpd/decimal128.c",
+            "qemu/libdecnumber/dpd/decimal32.c",
+            "qemu/libdecnumber/dpd/decimal64.c",
+            "qemu/target/ppc/compat.c",
+            "qemu/target/ppc/cpu.c",
+            "qemu/target/ppc/cpu-models.c",
+            "qemu/target/ppc/dfp_helper.c",
+            "qemu/target/ppc/excp_helper.c",
+            "qemu/target/ppc/fpu_helper.c",
+            "qemu/target/ppc/int_helper.c",
+            "qemu/target/ppc/machine.c",
+            "qemu/target/ppc/mem_helper.c",
+            "qemu/target/ppc/misc_helper.c",
+            "qemu/target/ppc/mmu-book3s-v3.c",
+            "qemu/target/ppc/mmu-hash32.c",
+            "qemu/target/ppc/mmu-hash64.c",
+            "qemu/target/ppc/mmu_helper.c",
+            "qemu/target/ppc/mmu-radix64.c",
+            "qemu/target/ppc/timebase_helper.c",
+            "qemu/target/ppc/translate.c",
+            "qemu/target/ppc/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/ppc"},
+        .autogen_header_contents = @embedFile("qemu/ppc64.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_PPC = true,
+        .TARGET_PPC64 = true,
+        .TARGET_WORDS_BIGENDIAN = true,
+    });
+
+    const libriscv32_softmmu = createTargetLibrary(b, host, .{
+        .name = "riscv32-softmmu",
+        .files = &.{
+            "qemu/target/riscv/cpu.c",
+            "qemu/target/riscv/cpu_helper.c",
+            "qemu/target/riscv/csr.c",
+            "qemu/target/riscv/fpu_helper.c",
+            "qemu/target/riscv/op_helper.c",
+            "qemu/target/riscv/pmp.c",
+            "qemu/target/riscv/translate.c",
+            "qemu/target/riscv/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/riscv"},
+        .autogen_header_contents = @embedFile("qemu/riscv32.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_RISCV = true,
+        .TARGET_RISCV32 = true,
+    });
+
+    const libriscv64_softmmu = createTargetLibrary(b, host, .{
+        .name = "riscv64-softmmu",
+        .files = &.{
+            "qemu/target/riscv/cpu.c",
+            "qemu/target/riscv/cpu_helper.c",
+            "qemu/target/riscv/csr.c",
+            "qemu/target/riscv/fpu_helper.c",
+            "qemu/target/riscv/op_helper.c",
+            "qemu/target/riscv/pmp.c",
+            "qemu/target/riscv/translate.c",
+            "qemu/target/riscv/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/riscv"},
+        .autogen_header_contents = @embedFile("qemu/riscv64.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_RISCV = true,
+        .TARGET_RISCV64 = true,
+    });
+
+    const libs390x_softmmu = createTargetLibrary(b, host, .{
+        .name = "s390x-softmmu",
+        .files = &.{
+            "qemu/hw/s390x/s390-skeys.c",
+            "qemu/target/s390x/cc_helper.c",
+            "qemu/target/s390x/cpu.c",
+            "qemu/target/s390x/cpu_features.c",
+            "qemu/target/s390x/cpu_models.c",
+            "qemu/target/s390x/crypto_helper.c",
+            "qemu/target/s390x/excp_helper.c",
+            "qemu/target/s390x/fpu_helper.c",
+            "qemu/target/s390x/helper.c",
+            "qemu/target/s390x/interrupt.c",
+            "qemu/target/s390x/int_helper.c",
+            "qemu/target/s390x/ioinst.c",
+            "qemu/target/s390x/mem_helper.c",
+            "qemu/target/s390x/misc_helper.c",
+            "qemu/target/s390x/mmu_helper.c",
+            "qemu/target/s390x/sigp.c",
+            "qemu/target/s390x/tcg-stub.c",
+            "qemu/target/s390x/translate.c",
+            "qemu/target/s390x/vec_fpu_helper.c",
+            "qemu/target/s390x/vec_helper.c",
+            "qemu/target/s390x/vec_int_helper.c",
+            "qemu/target/s390x/vec_string_helper.c",
+            "qemu/target/s390x/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/s390x"},
+        .autogen_header_contents = @embedFile("qemu/s390x.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_S390X = true,
+        .TARGET_WORDS_BIGENDIAN = true,
+    });
+
+    const libtricore_softmmu = createTargetLibrary(b, host, .{
+        .name = "tricore-softmmu",
+        .files = &.{
+            "qemu/target/tricore/cpu.c",
+            "qemu/target/tricore/fpu_helper.c",
+            "qemu/target/tricore/helper.c",
+            "qemu/target/tricore/op_helper.c",
+            "qemu/target/tricore/translate.c",
+            "qemu/target/tricore/unicorn.c",
+        },
+        .include_paths = &.{"qemu/target/tricore"},
+        .autogen_header_contents = @embedFile("qemu/tricore.h"),
+    }, .{
+        .CONFIG_SOFTMMU = true,
+        .TARGET_TRICORE = true,
+    });
+
+    const libunicorn = unicorn: {
+        const mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        mod.addConfigHeader(host.config_header);
+        for (host.include_paths) |path| mod.addIncludePath(path);
+        mod.linkLibrary(libunicorn_common);
+        var it = archs.iterator();
+        while (it.next()) |arch| {
+            switch (arch) {
+                .x86 => mod.linkLibrary(libx86_64_softmmu),
+                .arm => mod.linkLibrary(libarm_softmmu),
+                .aarch64 => mod.linkLibrary(libaarch64_softmmu),
+                .m68k => mod.linkLibrary(libm68k_softmmu),
+                .mips => {
+                    mod.linkLibrary(libmips_softmmu);
+                    mod.linkLibrary(libmipsel_softmmu);
+                    mod.linkLibrary(libmips64_softmmu);
+                    mod.linkLibrary(libmips64el_softmmu);
+                },
+                .sparc => {
+                    mod.linkLibrary(libsparc_softmmu);
+                    mod.linkLibrary(libsparc64_softmmu);
+                },
+                .ppc => {
+                    mod.linkLibrary(libppc_softmmu);
+                    mod.linkLibrary(libppc64_softmmu);
+                },
+                .riscv => {
+                    mod.linkLibrary(libriscv32_softmmu);
+                    mod.linkLibrary(libriscv64_softmmu);
+                },
+                .s390x => mod.linkLibrary(libs390x_softmmu),
+                .tricore => mod.linkLibrary(libtricore_softmmu),
             }
         }
-    }
-
-    // CMake Build
-    const cmake = cmakeBuild(b, parallel_cmake);
-    const cmake_step = b.step("cmake", "Run cmake build");
-    cmake_step.dependOn(&cmake.step);
-}
-
-fn buildExe(b: *std.Build, info: BuildInfo) *std.Build.Step.Compile {
-    const target = info.stdTarget();
-
-    const execonfig: std.Build.ExecutableOptions = switch (info.filetype) {
-        .c, .cpp => .{
-            .name = info.filename(),
-            .target = info.target,
-            .optimize = info.optimize,
-        },
-        else => .{
-            .name = info.filename(),
-            .target = info.target,
-            .optimize = info.optimize,
-            .root_source_file = b.path(info.filepath),
-        },
-    };
-    const exe = b.addExecutable(execonfig);
-
-    if (info.filetype != .zig) {
-        exe.addCSourceFile(.{
-            .file = b.path(info.filepath),
-            .flags = &.{
-                "-Wall",
-                "-Werror",
-                "-fno-sanitize=all",
-                "-Wshadow",
+        mod.addCSourceFiles(.{
+            .root = b.path(""),
+            .files = &.{
+                "uc.c",
+                "qemu/softmmu/vl.c",
+                "qemu/hw/core/cpu.c",
             },
+            .flags = cflags,
         });
+        const lib = b.addLibrary(.{
+            .name = "unicorn",
+            .root_module = mod,
+        });
+        lib.lto = lto;
+        lib.installHeadersDirectory(b.path("include/unicorn"), "unicorn", .{});
+        break :unicorn lib;
+    };
 
-        // Ensure the C headers are available
-        exe.addIncludePath(b.path("include"));
-
-        // Ensure the C library is available
-        exe.addLibraryPath(b.path("build"));
-
-        // linking to OS-LibC or static-linking for:
-        // Musl(Linux) [e.g: -Dtarget=native-linux-musl]
-        // MinGW(Windows) [e.g: -Dtarget=native-windows-gnu (default)]
-        if (info.filetype == .cpp and target.abi != .msvc)
-            exe.linkLibCpp() // static-linking LLVM-libcxx (all targets) + libC
-        else
-            exe.linkLibC();
-
-        // Now link the C library
-        if (target.abi == .msvc and target.os.tag == .windows) {
-            exe.linkSystemLibrary("unicorn.dll");
-        } else exe.linkSystemLibrary("unicorn");
-    }
-
-    // Linking to the Unicorn library
-    if (target.abi == .msvc and target.os.tag == .windows) {
-        exe.want_lto = false;
-    }
-
-    // This declares intent for the executable to be installed into the
-    // standard location when the user invokes the "install" step (the default
-    // step when running `zig build`).
-    b.installArtifact(exe);
-
-    // This *creates* a RunStep in the build graph, to be executed when another
-    // step is evaluated that depends on it. The next line below will establish
-    // such a dependency.
-    const run_cmd = b.addRunArtifact(exe);
-
-    // By making the run step depend on the install step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
-    // This is not necessary, however, if the application depends on other installed
-    // files, this ensures they will be present and in the expected location.
-    run_cmd.step.dependOn(b.getInstallStep());
-
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
-    // This creates a build step. It will be visible in the `zig build --help` menu,
-    // and can be selected like this: `zig build run`
-    // This will evaluate the `run` step rather than the default, which is "install".
-    const run_step = b.step(info.filename(), b.fmt("Run the {s}.", .{info.filename()}));
-    run_step.dependOn(&run_cmd.step);
-
-    return exe;
+    b.installArtifact(libunicorn);
 }
-
-const PARALLEL_CMAKE_COMMAND = [_][]const u8{
-    "cmake",
-    "--build",
-    "build",
-    "--config",
-    "release",
-    "--parallel",
-};
-
-const SINGLE_CMAKE_COMMAND = [_][]const u8{
-    "cmake",
-    "--build",
-    "build",
-    "--config",
-    "release",
-};
-fn cmakeBuild(b: *std.Build, parallel_cmake: bool) *std.Build.Step.Run {
-    const preconf = b.addSystemCommand(&.{
-        "cmake",
-        "-B",
-        "build",
-        "-DZIG_BUILD=ON",
-        "-DUNICORN_BUILD_TESTS=OFF",
-        "-DUNICORN_INSTALL=OFF",
-        "-DCMAKE_BUILD_TYPE=Release",
-    });
-
-    // build in parallel if requested
-    const cmakebuild = b.addSystemCommand(blk: {
-        if (parallel_cmake) {
-            break :blk &PARALLEL_CMAKE_COMMAND;
-        } else {
-            break :blk &SINGLE_CMAKE_COMMAND;
-        }
-    });
-    cmakebuild.step.dependOn(&preconf.step);
-    return cmakebuild;
-}
-
-// ensures the currently in-use zig version is at least the minimum required
-fn checkVersion() bool {
-    const builtin = @import("builtin");
-    if (!@hasDecl(builtin, "zig_version")) {
-        return false;
-    }
-
-    const needed_version = std.SemanticVersion.parse(MIN_ZIG_VERSION) catch unreachable;
-    const version = builtin.zig_version;
-    const order = version.order(needed_version);
-    return order != .lt;
-}
-
-const BuildInfo = struct {
-    filepath: []const u8,
-    filetype: SampleFileTypes,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-
-    fn filename(self: BuildInfo) []const u8 {
-        var split = std.mem.splitSequence(u8, std.fs.path.basename(self.filepath), ".");
-        return split.first();
-    }
-
-    fn stdTarget(self: *const BuildInfo) std.Target {
-        return self.target.result;
-    }
-};
