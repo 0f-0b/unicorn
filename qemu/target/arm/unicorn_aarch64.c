@@ -181,7 +181,7 @@ uc_err reg_read(void *_env, int mode, unsigned int regid, void *value,
     } else if (regid >= UC_ARM64_REG_SP_EL0 && regid <= UC_ARM64_REG_SP_EL3) {
         CHECK_REG_TYPE(uint64_t);
         *(uint64_t *)value = env->sp_el[regid - UC_ARM64_REG_SP_EL0];
-    } else if (regid >= UC_ARM64_REG_ESR_EL0 && regid <= UC_ARM64_REG_ESR_EL3) {
+    } else if (regid >= UC_ARM64_REG_ESR_EL1 && regid <= UC_ARM64_REG_ESR_EL3) {
         CHECK_REG_TYPE(uint64_t);
         *(uint64_t *)value = env->cp15.esr_el[regid - UC_ARM64_REG_ESR_EL0];
     } else if (regid >= UC_ARM64_REG_FAR_EL0 && regid <= UC_ARM64_REG_FAR_EL3) {
@@ -275,6 +275,10 @@ uc_err reg_read(void *_env, int mode, unsigned int regid, void *value,
             CHECK_REG_TYPE(uint32_t);
             *(uint32_t *)value = 0;
             break;
+        case UC_ARM64_REG_ESR_EL0:
+            CHECK_REG_TYPE(uint32_t);
+            *(uint32_t *)value = env->exception.syndrome;
+            break;
         }
     }
 
@@ -325,7 +329,7 @@ uc_err reg_write(void *_env, int mode, unsigned int regid, const void *value,
     } else if (regid >= UC_ARM64_REG_SP_EL0 && regid <= UC_ARM64_REG_SP_EL3) {
         CHECK_REG_TYPE(uint64_t);
         env->sp_el[regid - UC_ARM64_REG_SP_EL0] = *(uint64_t *)value;
-    } else if (regid >= UC_ARM64_REG_ESR_EL0 && regid <= UC_ARM64_REG_ESR_EL3) {
+    } else if (regid >= UC_ARM64_REG_ESR_EL1 && regid <= UC_ARM64_REG_ESR_EL3) {
         CHECK_REG_TYPE(uint64_t);
         env->cp15.esr_el[regid - UC_ARM64_REG_ESR_EL0] = *(uint64_t *)value;
     } else if (regid >= UC_ARM64_REG_FAR_EL0 && regid <= UC_ARM64_REG_FAR_EL3) {
@@ -420,6 +424,10 @@ uc_err reg_write(void *_env, int mode, unsigned int regid, const void *value,
         case UC_ARM64_REG_WZR:
             CHECK_REG_TYPE(uint32_t);
             // no-ops actually
+            break;
+        case UC_ARM64_REG_ESR_EL0:
+            CHECK_REG_TYPE(uint32_t);
+            env->exception.syndrome = *(uint32_t *)value;
             break;
         }
     }
