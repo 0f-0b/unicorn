@@ -984,11 +984,10 @@ static inline void *tcg_malloc(TCGContext *tcg_ctx, int size)
     size = QEMU_ALIGN_UP(size, 8);
 
     ptr = s->pool_cur;
-    ptr_end = ptr + size;
-    if (unlikely(ptr_end > s->pool_end)) {
+    if (unlikely(size > s->pool_end - ptr)) {
         return tcg_malloc_internal(tcg_ctx, size);
     } else {
-        s->pool_cur = ptr_end;
+        s->pool_cur = ptr + size;
         return ptr;
     }
 }
