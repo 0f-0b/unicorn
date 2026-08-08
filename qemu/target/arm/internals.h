@@ -260,7 +260,7 @@ static inline bool extended_addresses_enabled(CPUARMState *env)
 }
 
 /* Valid Syndrome Register EC field values */
-enum arm_exception_class {
+enum arm_exception_class : unsigned {
     EC_UNCATEGORIZED          = 0x00,
     EC_WFX_TRAP               = 0x01,
     EC_CP15RTTRAP             = 0x03,
