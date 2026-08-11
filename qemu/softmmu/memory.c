@@ -907,6 +907,11 @@ static void address_space_update_topology_pass(AddressSpace *as,
     }
 }
 
+static void flatview_hashtable_data_destroy(void *view)
+{
+    flatview_unref(view);
+}
+
 static void flatviews_init(struct uc_struct *uc)
 {
     if (uc->flat_views) {
@@ -914,7 +919,7 @@ static void flatviews_init(struct uc_struct *uc)
     }
 
     uc->flat_views = g_hash_table_new_full(NULL, NULL, NULL,
-                                       (GDestroyNotify) flatview_unref);
+                                           flatview_hashtable_data_destroy);
 
     if (!uc->empty_view) {
         uc->empty_view = generate_memory_topology(uc, NULL);
